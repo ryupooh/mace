@@ -1,11 +1,82 @@
+import importlib.util
 from typing import Optional, Tuple
 
 import numpy as np
-import torch
-from torch_cluster import radius_graph
+from matscipy.neighbours import neighbour_list
+
+try:
+    import torch
+    from torch_cluster import radius_graph
+except ImportError:
+    torch = None
+
+def _check_package_available(package_name: str) -> bool:
+    return importlib.util.find_spec(package_name) is not None
+
+def _get_neighborhood_matscipy(
+    positions: np.ndarray,  # [num_positions, 3]
+    cutoff: float,
+    pbc: Optional[Tuple[bool, bool, bool]] = None,
+    cell: Optional[np.ndarray] = None,  # [3, 3]
+    true_self_interaction=False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+
+    if pbc is None:
+        pbc = (False, False, False)
+
+    if cell is None or cell.any() == np.zeros((3, 3)).any():
+        cell = np.identity(3, dtype=float)
+
+    assert len(pbc) == 3 and all(isinstance(i, (bool, np.bool_)) for i in pbc)
+    assert cell.shape == (3, 3)
+
+    pbc_x = pbc[0]
+    pbc_y = pbc[1]
+    pbc_z = pbc[2]
+    identity = np.identity(3, dtype=float)
+    max_positions = np.max(np.absolute(positions)) + 1
+    # Extend cell in non-periodic directions
+    # For models with more than 5 layers, the multiplicative constant needs to be increased.
+    # temp_cell = np.copy(cell)
+    if not pbc_x:
+        cell[0, :] = max_positions * 5 * cutoff * identity[0, :]
+    if not pbc_y:
+        cell[1, :] = max_positions * 5 * cutoff * identity[1, :]
+    if not pbc_z:
+        cell[2, :] = max_positions * 5 * cutoff * identity[2, :]
+
+    sender, receiver, unit_shifts = neighbour_list(
+        quantities="ijS",
+        pbc=pbc,
+        cell=cell,
+        positions=positions,
+        cutoff=cutoff,
+        # self_interaction=True,  # we want edges from atom to itself in different periodic images
+        # use_scaled_positions=False,  # positions are not scaled positions
+    )
 
 
-def get_neighborhood(
+    if not true_self_interaction:
+        # Eliminate self-edges that don't cross periodic boundaries
+        true_self_edge = sender == receiver
+        true_self_edge &= np.all(unit_shifts == 0, axis=1)
+        keep_edge = ~true_self_edge
+ 
+        # Note: after eliminating self-edges, it can be that no edges remain in this system
+        sender = sender[keep_edge]
+        receiver = receiver[keep_edge]
+        unit_shifts = unit_shifts[keep_edge]
+ 
+    # Build output
+    edge_index = np.stack((sender, receiver))  # [2, n_edges]
+ 
+    # From the docs: With the shift vector S, the distances D between atoms can be computed from
+    # D = positions[j]-positions[i]+S.dot(cell)
+    shifts = np.dot(unit_shifts, cell)  # [n_edges, 3]
+
+    return edge_index, shifts, unit_shifts, cell 
+
+def _get_neighborhood_torch(
     positions: np.ndarray,  # [num_positions, 3]
     cutoff: float,
     pbc: Optional[Tuple[bool, bool, bool]] = None,
@@ -47,3 +118,28 @@ def get_neighborhood(
 
     edge_index = np.stack((sender, receiver))
     return edge_index, shifts, unit_shifts, cell
+
+
+if  _check_package_available("torch") and _check_package_available("torch_cluster"):
+    _is_neighborhood_torch_available = True
+    print("get_neighborhood will use torch_cluster for neighborhood detection. It'll be applied only if no PBC is used.")
+
+
+def get_neighborhood(
+    positions: np.ndarray,  # [num_positions, 3]
+    cutoff: float,
+    pbc: Optional[Tuple[bool, bool, bool]] = None,
+    cell: Optional[np.ndarray] = None,  # [3, 3]
+    true_self_interaction=False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if pbc is None:
+        pbc = (False, False, False)
+
+    if _is_neighborhood_torch_available and not any(pbc):
+        return _get_neighborhood_torch(
+            positions, cutoff, pbc=pbc, cell=cell, true_self_interaction=true_self_interaction
+        )
+    else:
+       return _get_neighborhood_matscipy(
+            positions, cutoff, pbc=pbc, cell=cell, true_self_interaction=true_self_interaction
+        )
